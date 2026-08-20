@@ -112,13 +112,12 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
     import gc
     lang_code = LANG_MAP.get(config.lower(), config.lower())
     parquet_filename = f"{lang_code}{split}.parquet"
-    parquet_url = f"https://huggingface.co/datasets/{HF_DATASET_ID}/resolve/main/{split}/{parquet_filename}"
-    logger.info(f"Streaming {limit or 'all'} MSMARCO-XI records live from Hugging Face ({parquet_filename})...")
+    target_limit = min(limit or 100, 100)
+    logger.info(f"Streaming {target_limit} MSMARCO-XI records live from Hugging Face ({parquet_filename})...")
     rows = []
 
     # Strategy 1: Ultra-lightweight Hugging Face Datasets API (0 RAM overhead)
     try:
-        req_limit = limit or 100
         hf_api_url = f"{DATASETS_SERVER_BASE}/rows"
         resp = requests.get(
             hf_api_url,
@@ -127,9 +126,9 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
                 "config": config,
                 "split": split,
                 "offset": 0,
-                "length": min(req_limit, 100),
+                "length": target_limit,
             },
-            timeout=15,
+            timeout=10,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -139,12 +138,12 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
     except Exception as exc_hf:
         logger.warning(f"HF API notice: {exc_hf}")
 
-    # Strategy 2: Fast fsspec protocol-aware reader with small memory buffer
+    # Strategy 2: Fast fsspec protocol-aware reader reading only a 100-record batch
     if not rows:
         try:
             import fsspec
             import pyarrow.parquet as pq
-            with fsspec.open(parquet_url, "rb", block_size=1 * 1024 * 1024) as f:
+            with fsspec.open(parquet_url, "rb", block_size=512 * 1024) as f:
                 parquet_file = pq.ParquetFile(f)
                 available_cols = set(parquet_file.schema.names)
                 desired_cols = {
@@ -152,11 +151,10 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
                     "Answer", "Eng_Answer", "query_id", "id", "passage", "text", "Hindi_Passage", "Marathi_Passage"
                 }
                 read_cols = [c for c in available_cols if c in desired_cols] or None
-                table = parquet_file.read_row_group(0, columns=read_cols)
-                chunk_rows = table.to_pylist()
-                rows = chunk_rows[:limit] if limit else chunk_rows
-                del table, chunk_rows
-                gc.collect()
+                for batch in parquet_file.iter_batches(batch_size=target_limit, columns=read_cols):
+                    rows = batch.to_pylist()[:target_limit]
+                    break
+            gc.collect()
             logger.info(f"Successfully streamed {len(rows)} query records directly into Vector DB pipeline.")
         except Exception as exc1:
             logger.warning(f"Strategy 2 (fsspec) notice: {exc1}; using fast in-memory HTTP stream...")
@@ -166,22 +164,22 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
                 resp = requests.get(parquet_url, stream=True, timeout=30)
                 resp.raise_for_status()
                 buf = io.BytesIO()
-                for chunk in resp.iter_content(chunk_size=512 * 1024):
+                for chunk in resp.iter_content(chunk_size=256 * 1024):
                     buf.write(chunk)
-                    if buf.tell() >= 4 * 1024 * 1024:
+                    if buf.tell() >= 2 * 1024 * 1024:
                         break
                 buf.seek(0)
                 try:
-                    table = pq.read_table(buf)
-                    rows = table.to_pylist()[:limit] if limit else table.to_pylist()
+                    parquet_file = pq.ParquetFile(buf)
+                    for batch in parquet_file.iter_batches(batch_size=target_limit):
+                        rows = batch.to_pylist()[:target_limit]
+                        break
                 except Exception:
-                    buf.write(resp.content)
-                    buf.seek(0)
-                    table = pq.read_table(buf)
-                    rows = table.to_pylist()[:limit] if limit else table.to_pylist()
-                del table, buf
+                    pass
+                del buf
                 gc.collect()
-                logger.info(f"Successfully streamed {len(rows)} query records via direct stream.")
+                if rows:
+                    logger.info(f"Successfully streamed {len(rows)} query records via stream batch.")
             except Exception as exc2:
                 logger.warning(f"Strategy 3 notice: {exc2}")
                 raise RuntimeError(f"Could not stream MSMARCO-XI partition {parquet_filename}: {exc1} | {exc2}")
