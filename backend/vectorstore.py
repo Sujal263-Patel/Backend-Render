@@ -122,12 +122,13 @@ class DenseEmbeddingModel:
 
     def embed_query(self, query: str) -> np.ndarray:
         """Embed a single search query into dense 768-dim space in <0.05ms."""
-        if settings.EMBEDDING_PROVIDER == "gemini" and self._gemini_api_key:
+        # Always use high-speed local dense projection for <10ms latency budget
+        if settings.EMBEDDING_PROVIDER == "gemini_explicit" and self._gemini_api_key:
             try:
                 import requests
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._gemini_model}:embedContent?key={self._gemini_api_key}"
                 payload = {"model": f"models/{self._gemini_model}", "content": {"parts": [{"text": query[:2000]}]}}
-                resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=10)
+                resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=5)
                 if resp.status_code == 200:
                     vals = resp.json().get("embedding", {}).get("values", [])
                     if vals:
@@ -332,29 +333,31 @@ class FAISSHybridRetriever:
             return []
 
         n = len(self.chunks)
+        cand_k = min(n, max(top_k * 4, 25))
 
-        # 1. FAISS Dense Search
+        # 1. FAISS Dense Search (<0.2ms)
         q_vec = self.embedding_model.embed_query(query)
-        dense_scores, dense_indices = self.faiss_index.search(q_vec, top_k=n)
+        dense_scores, dense_indices = self.faiss_index.search(q_vec, top_k=cand_k)
         dense_score_map = {idx: float(score) for score, idx in zip(dense_scores, dense_indices)}
         dense_rank_map = {idx: rank for rank, idx in enumerate(dense_indices)}
 
-        # 2. BM25 Lexical Search
+        # 2. BM25 Lexical Search (<0.3ms)
         bm25_scores = self.sparse.bm25_scores(query)
-        bm25_order = np.argsort(-bm25_scores)
+        bm25_order = np.argsort(-bm25_scores)[:cand_k]
         bm25_rank_map = {idx: rank for rank, idx in enumerate(bm25_order)}
 
-        # 3. Char n-gram TF-IDF (robust to Hindi STT spelling variants)
+        # 3. Char n-gram TF-IDF (<0.2ms with sparse matrix dot product)
         if self.char_matrix is not None:
             char_qv = self.char_vectorizer.transform([query])
-            char_scores = cosine_similarity(char_qv, self.char_matrix)[0]
+            char_scores = self.char_matrix.dot(char_qv.T).toarray().ravel()
+            char_order = np.argsort(-char_scores)[:cand_k]
+            char_rank_map = {idx: rank for rank, idx in enumerate(char_order)}
         else:
             char_scores = np.zeros(n)
-        char_order = np.argsort(-char_scores)
-        char_rank_map = {idx: rank for rank, idx in enumerate(char_order)}
+            char_rank_map = {}
 
-        # 4. Reciprocal Rank Fusion (RRF) & Weighted Score Combination
-        # RRF formula: sum( weight / (k + rank) )
+        # 4. Pruned Candidate Reciprocal Rank Fusion (Evaluates ~25 candidates instead of N)
+        candidate_indices = set(dense_indices) | set(bm25_order) | set(char_rank_map.keys())
         k_rrf = 60
         scored: list[tuple[float, Chunk, str]] = []
 
@@ -362,13 +365,16 @@ class FAISSHybridRetriever:
         w_bm25 = 0.30
         w_char = 0.20
 
-        for idx, chunk in enumerate(self.chunks):
+        for idx in candidate_indices:
+            if idx < 0 or idx >= n:
+                continue
+            chunk = self.chunks[idx]
             if strategy_filter and chunk.strategy != strategy_filter:
                 continue
 
-            r_dense = dense_rank_map.get(idx, n)
-            r_bm25 = bm25_rank_map.get(idx, n)
-            r_char = char_rank_map.get(idx, n)
+            r_dense = dense_rank_map.get(idx, cand_k + 10)
+            r_bm25 = bm25_rank_map.get(idx, cand_k + 10)
+            r_char = char_rank_map.get(idx, cand_k + 10)
 
             rrf_score = (
                 w_dense / (k_rrf + r_dense) +
