@@ -11,3 +11,5 @@ tenacity==9.0.0
 python-dotenv==1.0.1
 datasets==2.21.0
 faiss-cpu>=1.8.0
+pyarrow>=14.0.0
+fsspec>=2023.6.0
