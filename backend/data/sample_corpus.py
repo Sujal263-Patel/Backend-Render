@@ -137,7 +137,7 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
             if rows:
                 logger.info(f"Successfully streamed {len(rows)} records via low-memory Hugging Face API.")
     except Exception as exc_hf:
-        logger.warning(f"HF API fallback notice: {exc_hf}")
+        logger.warning(f"HF API notice: {exc_hf}")
 
     # Strategy 2: Fast fsspec protocol-aware reader with small memory buffer
     if not rows:
@@ -162,7 +162,6 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
             logger.warning(f"Strategy 2 (fsspec) notice: {exc1}; using fast in-memory HTTP stream...")
             try:
                 import io
-                import requests
                 import pyarrow.parquet as pq
                 resp = requests.get(parquet_url, stream=True, timeout=30)
                 resp.raise_for_status()
