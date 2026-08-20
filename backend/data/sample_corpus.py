@@ -112,6 +112,7 @@ def load_real_dataset(config: str = "hi", split: str = "train", limit: int | Non
     import gc
     lang_code = LANG_MAP.get(config.lower(), config.lower())
     parquet_filename = f"{lang_code}{split}.parquet"
+    parquet_url = f"https://huggingface.co/datasets/{HF_DATASET_ID}/resolve/main/{split}/{parquet_filename}"
     target_limit = min(limit or 100, 100)
     logger.info(f"Streaming {target_limit} MSMARCO-XI records live from Hugging Face ({parquet_filename})...")
     rows = []

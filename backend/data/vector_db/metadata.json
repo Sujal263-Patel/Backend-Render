@@ -1,8 +1,0 @@
-{
-  "num_chunks": 1932,
-  "num_docs": 602,
-  "embedding_dimension": 768,
-  "data_source": "ai4bharat/MSMARCO-XI/hi streamed (602 passages)",
-  "saved_at": "2026-08-18 22:54:47",
-  "vector_db_type": "FAISS IndexFlatIP + Tri-Fusion RRF"
-}
